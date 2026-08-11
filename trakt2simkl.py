@@ -262,20 +262,38 @@ def movie_key(trakt_ids, title, year):
     )
 
 
-def earlier(a, b):
+def latest(a, b):
+    # Trakt's export has one row per watch event, not just the most recent — a
+    # rewatched episode/movie has multiple entries with different watched_at
+    # values. Progress tracking on Simkl needs the most recent watch, so this
+    # must keep the maximum, not the minimum (ISO 8601 timestamps compare
+    # correctly as plain strings).
     if a is None:
         return b
     if b is None:
         return a
-    return a if a < b else b
+    return a if a > b else b
 
 
 def parse_watched_history(export_dir):
-    """Returns (movies: dict[key -> record], shows: dict[key -> record])."""
+    """Returns (movies: dict[key -> record], shows: dict[key -> record],
+    episode_tvdb_ids: dict[tvdb_episode_id -> watched_at]).
+
+    episode_tvdb_ids is a second, independent representation of the same episode
+    watches, keyed by each episode's own TVDB id (present in Trakt's export) rather
+    than by show + season/episode number. Some shows — anime especially (e.g. JoJo's
+    Bizarre Adventure) — are split into seasons differently on Simkl than on
+    Trakt/TMDB, so sending season/episode *numbers* silently fails to match anything
+    past wherever the two numbering schemes diverge. Simkl's API also accepts
+    matching an episode directly by its own TVDB id, which sidesteps that mismatch
+    entirely — see markEpisodeAsWatched()'s TVDB-id fallback in this addon's own
+    simkl.py for the confirmed working request shape this mirrors.
+    """
     events = load_glob(export_dir, "watched-history-*.json")
 
     movies = {}  # key -> {ids_obj, watched_at}
     shows = {}  # key -> {ids_obj, seasons: {season_num: {ep_num: watched_at}}}
+    episode_tvdb_ids = {}  # tvdb_episode_id -> watched_at
 
     for ev in events:
         watched_at = ev.get("watched_at")
@@ -285,7 +303,7 @@ def parse_watched_history(export_dir):
             rec = movies.setdefault(
                 k, {"ids_obj": movie_ids(m["ids"], m.get("title"), m.get("year")), "watched_at": None}
             )
-            rec["watched_at"] = earlier(rec["watched_at"], watched_at)
+            rec["watched_at"] = latest(rec["watched_at"], watched_at)
         elif ev.get("type") == "episode":
             show = ev["show"]
             ep = ev["episode"]
@@ -295,12 +313,18 @@ def parse_watched_history(export_dir):
             )
             season_num = ep.get("season")
             ep_num = ep.get("number")
-            if season_num is None or ep_num is None:
-                continue
-            season_bucket = rec["seasons"].setdefault(season_num, {})
-            season_bucket[ep_num] = earlier(season_bucket.get(ep_num), watched_at)
+            if season_num is not None and ep_num is not None:
+                season_bucket = rec["seasons"].setdefault(season_num, {})
+                season_bucket[ep_num] = latest(season_bucket.get(ep_num), watched_at)
+            ep_tvdb = ep.get("ids", {}).get("tvdb")
+            if ep_tvdb:
+                episode_tvdb_ids[ep_tvdb] = latest(episode_tvdb_ids.get(ep_tvdb), watched_at)
 
-    return movies, shows
+    return movies, shows, episode_tvdb_ids
+
+
+def build_history_episode_id_payloads(episode_tvdb_ids):
+    return [{"ids": {"tvdb": tvdb_id}, "watched_at": watched_at} for tvdb_id, watched_at in episode_tvdb_ids.items()]
 
 
 def parse_ratings(export_dir):
@@ -390,6 +414,27 @@ def build_history_movie_payload(rec):
     return out
 
 
+def report_not_found(resp):
+    # Simkl's /sync/history response mirrors Trakt's own sync-response shape: items it
+    # couldn't match get listed under "not_found" instead of raising an error for the
+    # whole batch, so a failed match is otherwise completely silent. Print whatever
+    # Simkl gives back for them (title if it echoed one, otherwise the ids we sent) so a
+    # show that silently failed to import (wrong/missing ids, no Simkl match, etc.) is
+    # actually visible instead of just missing later with no explanation.
+    try:
+        not_found = (resp or {}).get("not_found") or {}
+        for bucket, items in not_found.items():
+            if not items:
+                continue
+            print(f"    [Simkl couldn't match {len(items)} {bucket}]:")
+            for item in items:
+                ids = item.get("ids", item)
+                label = item.get("title") or ids
+                print(f"      - {label}")
+    except Exception as e:
+        print(f"    (couldn't parse not_found from response: {e})")
+
+
 # --------------------------------------------------------------------------
 # Interactive prompts (used when a required value isn't passed as a flag)
 # --------------------------------------------------------------------------
@@ -475,7 +520,7 @@ def main():
     export_dir = resolve_export_dir(args.export_dir or prompt_export_dir())
 
     print("Parsing Trakt export...")
-    movies, shows = parse_watched_history(export_dir)
+    movies, shows, episode_tvdb_ids = parse_watched_history(export_dir)
     movie_ratings, show_ratings, episode_ratings = parse_ratings(export_dir)
     wl_movies, wl_shows, wl_skipped = parse_watchlist(export_dir)
 
@@ -485,6 +530,7 @@ def main():
     print("Summary of what will be imported:")
     print(f"  Watched movies:        {len(movies)}")
     print(f"  Watched shows:         {len(shows)}  ({total_episodes} episode watch events)")
+    print(f"  Episode TVDB-id corrections: {len(episode_tvdb_ids)}  (fixes season-numbering mismatches, e.g. some anime)")
     print(f"  Movie ratings:         {len(movie_ratings)}")
     print(f"  Show ratings:          {len(show_ratings)}")
     print(f"  Episode ratings:       {len(episode_ratings)}")
@@ -511,7 +557,8 @@ def main():
 
         print(f"Sending {len(movie_payloads)} watched movies...")
         for batch in chunk(movie_payloads, 250):
-            api_post("/sync/history", client_id, token, {"movies": batch})
+            resp = api_post("/sync/history", client_id, token, {"movies": batch})
+            report_not_found(resp)
             time.sleep(POST_DELAY_SECONDS)
 
         print(f"Sending {len(show_payloads)} shows with episode watch data...")
@@ -521,14 +568,32 @@ def main():
         for payload in show_payloads:
             ep_count = sum(len(s["episodes"]) for s in payload["seasons"])
             if batch and (batch_eps + ep_count > 1500 or len(batch) >= 25):
-                api_post("/sync/history", client_id, token, {"shows": batch})
+                resp = api_post("/sync/history", client_id, token, {"shows": batch})
+                report_not_found(resp)
                 time.sleep(POST_DELAY_SECONDS)
                 batch, batch_eps = [], 0
             batch.append(payload)
             batch_eps += ep_count
         if batch:
-            api_post("/sync/history", client_id, token, {"shows": batch})
+            resp = api_post("/sync/history", client_id, token, {"shows": batch})
+            report_not_found(resp)
             time.sleep(POST_DELAY_SECONDS)
+
+        # Supplementary pass: re-send every watched episode matched by its own TVDB
+        # episode id rather than show + season/episode number. The season-numbered
+        # sends above cover the normal case; this corrects shows where Simkl's season
+        # numbering diverges from Trakt/TMDB's (common for anime) and the numbered
+        # send silently matched nothing past the divergence point. Safe/idempotent to
+        # send for every episode, not just the mismatched ones, since Simkl no-ops an
+        # already-recorded watch.
+        episode_id_payloads = build_history_episode_id_payloads(episode_tvdb_ids)
+        if episode_id_payloads:
+            print(f"Sending {len(episode_id_payloads)} episode watches by TVDB episode id "
+                  f"(corrects season-numbering mismatches)...")
+            for batch in chunk(episode_id_payloads, 250):
+                resp = api_post("/sync/history", client_id, token, {"episodes": batch})
+                report_not_found(resp)
+                time.sleep(POST_DELAY_SECONDS)
 
     # ---- Ratings ----
     if not args.skip_ratings:
