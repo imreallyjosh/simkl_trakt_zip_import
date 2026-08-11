@@ -1,0 +1,25 @@
+# Simkl credentials/token cache -- never commit these
+simkl_token.json
+token.json
+.trakt2simkl/
+
+# Python
+__pycache__/
+*.pyc
+
+# Trakt export data -- don't accidentally commit someone's watch history
+*.zip
+trakt-export*/
+watched-history-*.json
+collection-*.json
+ratings-*.json
+lists-*.json
+comments-*.json
+hidden-*.json
+network-*.json
+notes-*.json
+user-*.json
+
+# OS cruft
+.DS_Store
+Thumbs.db
